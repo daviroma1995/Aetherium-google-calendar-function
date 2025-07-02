@@ -7,27 +7,29 @@
     "serve": "npm run build && firebase emulators:start --only functions",
     "shell": "npm run build && firebase functions:shell",
     "start": "npm run shell",
-    "deploy": "firebase deploy --only functions",
-    "logs": "firebase functions:log"
+    "deploy": "firebase deploy --only functions:calendar:googleCalendarEvent",
+    "logs": "firebase functions:log --only googleCalendarEvent"
   },
   "engines": {
-    "node": "16"
+    "node": "20"
   },
   "main": "lib/index.js",
   "dependencies": {
-    "firebase-admin": "^11.10.1",
-    "firebase-functions": "^3.24.1",
+    "@google-cloud/storage": "^7.16.0",
+    "firebase-admin": "^12.7.0",
+    "firebase-functions": "^6.3.2",
     "google-auth-library": "^9.0.0",
-    "googleapis": "^126.0.1"
+    "googleapis": "^126.0.1",
+    "moment-timezone": "^0.5.48"
   },
   "devDependencies": {
     "@typescript-eslint/eslint-plugin": "^5.12.0",
     "@typescript-eslint/parser": "^5.12.0",
-    "eslint": "^8.9.0",
+    "eslint": "^8.57.0",
     "eslint-config-google": "^0.14.0",
     "eslint-plugin-import": "^2.25.4",
     "firebase-functions-test": "^0.2.0",
-    "typescript": "^4.5.4"
+    "typescript": "^5.8.3"
   },
   "private": true
 }

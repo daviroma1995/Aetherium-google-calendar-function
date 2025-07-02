@@ -1,15 +1,13 @@
-/* eslint-disable camelcase */
-/* eslint-disable max-len */
-/* eslint-disable require-jsdoc */
-import {calendar_v3, google} from "googleapis";
-import * as functions from "firebase-functions";
+import {google, calendar_v3 as CalendarV3} from "googleapis";
+import {onRequest} from "firebase-functions/v2/https";
 import * as admin from "firebase-admin";
+import moment from "moment-timezone";
 
 admin.initializeApp();
 const db = admin.firestore();
 
 interface Appointment {
-  id?: string;
+  id: string;
   google_calendar_event_id?: string;
   client_id: string;
   date: string;
@@ -17,6 +15,7 @@ interface Appointment {
   employee_id_list: string[];
   end_time: string;
   is_regular: boolean;
+  from_google_calendar: boolean;
   notes: string;
   number: string;
   room_id_list: string[];
@@ -24,6 +23,7 @@ interface Appointment {
   status_id: string;
   time: string;
   total_duration: number;
+  color_id: string;
   treatment_id_list: string[];
 }
 
@@ -41,243 +41,307 @@ interface Credentials {
 }
 
 interface Treatment {
-    id: string;
-    duration: number;
-    is_employee_required: boolean;
-    room_id_list: string[];
-    name: string;
-    treatment_category_name?: string;
-    treatment_category_id: string;
-  }
+  id: string;
+  duration: number;
+  is_employee_required: boolean;
+  room_id_list: string[];
+  name: string;
+  treatment_category_name?: string;
+  treatment_category_id: string;
+}
 
-  interface TreatmentCategory {
-    name: string;
-    id?: string;
-  }
-
-  interface GoogleCalendarResponse {
-    status: number; // Status code
-    data?: calendar_v3.Schema$Event; // Event data (optional)
-  }
+interface GoogleCalendarResponse {
+  status: number;
+  data?: CalendarV3.Schema$Event | {error: string};
+}
 
 interface Client {
-    address: string;
-    birthday: string;
-    email: string;
-    first_name: string;
-    last_name: string;
-    phone_number: string;
-  }
+  address: string;
+  birthday: string;
+  email: string;
+  first_name: string;
+  last_name: string;
+  phone_number: string;
+}
 
-  enum Operation {
-    UPDATE = "UPDATE",
-    DELETE = "DELETE",
-    CREATE = "CREATE",
-  }
+enum Operation {
+  UPDATE = "UPDATE",
+  DELETE = "DELETE",
+  CREATE = "CREATE"
+}
 
-  interface data {
-    appointment: Appointment;
-    appointment_id: string;
-    operation: Operation;
-  }
+interface RequestData {
+  appointment: Appointment;
+  appointment_id: string;
+  operation: Operation;
+}
 
-exports.googleCalendarEvent = functions.https.onRequest(async (data, context) => {
+exports.googleCalendarEvent = onRequest(async (req, res) => {
+  console.log(
+    "NEW VERSION - googleCalendarEvent running - " +
+    new Date().toLocaleString("it-IT", {timeZone: "Europe/Rome"})
+  );
   try {
-    const myData = data.body as data;
-    console.log("myData", myData);
-    console.log("appointment", myData.appointment);
-    console.log("appointment_id", myData?.appointment_id);
-    console.log("operation", myData?.operation);
-    console.log("client_id", myData.appointment?.client_id);
-    const credentials = await getGoogleOAuthConfig();
-    const calendar = google.calendar({
-      version: "v3",
-      auth: new google.auth.GoogleAuth({
-        credentials,
-        scopes: ["https://www.googleapis.com/auth/calendar"],
-      }),
-    });
+    console.log("Raw req.body:", JSON.stringify(req.body, null, 2));
+    const data = req.body as RequestData;
+    console.log("Parsed RequestData:", JSON.stringify(data, null, 2));
 
-    let googleResponse: GoogleCalendarResponse | undefined;
-
-    if (myData.operation === Operation.DELETE && myData?.appointment_id) {
-      const appRef = db.collection("appointments").doc(myData.appointment_id);
-      const appDocSnapshot = (await appRef.get()).data() as Appointment;
-      const eventId = appDocSnapshot.google_calendar_event_id;
-      if (!eventId) {
-        context.status(400).send({error: "Missing calendar event id"});
-        return;
-      }
-      await deleteEvent(eventId, calendar);
-      context.status(200).send("Function DELETE executed successfully.");
+    if (!data["appointment_id"]) {
+      console.error("Missing appointment_id in data:", JSON.stringify(data, null, 2));
+      res.status(400).send({error: "Missing appointment_id"});
       return;
-    } else {
-      if (!myData.appointment_id) {
-        context.status(400).send({error: "Missing appointmentId"});
-      }
-
-      const event = await getGoogleCalendarEventFromAppointment(myData.appointment);
-      console.log("event", event);
-      if (!event) {
-        context.status(400).send({error: "Failed to get Google Calendar event"});
-        return;
-      }
-
-      if (myData.operation === Operation.CREATE) {
-        googleResponse = await createEvent(calendar, event, myData.appointment_id);
-      } else if (myData.operation === Operation.UPDATE) {
-        const appRef = db.collection("appointments").doc(myData.appointment_id);
-        const appDocSnapshot = (await appRef.get()).data() as Appointment;
-        const eventId = appDocSnapshot.google_calendar_event_id;
-        if (eventId) {
-          googleResponse = await editEvent(eventId, calendar, event);
-        }
-      }
     }
 
-    console.log("googleResponse", googleResponse);
-    if (googleResponse?.status === 200) {
-      context.status(200).send("Function executed successfully.");
+    const credentials = await getGoogleOAuthConfig();
+    const auth = new google.auth.GoogleAuth({
+      credentials,
+      scopes: ["https://www.googleapis.com/auth/calendar"],
+    });
+    const calendar = google.calendar({version: "v3", auth});
+
+    if (data.operation === Operation.DELETE) {
+      await handleDeleteOperation(data["appointment_id"], calendar, res);
     } else {
-      context.status(400).send("Function executed unsuccessfully.");
+      const event = await getGoogleCalendarEvent(data.appointment, data["appointment_id"]);
+      console.log("Generated Google Calendar Event CREATE:", JSON.stringify(event, null, 2));
+
+      if (!event) {
+        console.error("Failed to generate Google Calendar Event");
+        res.status(400).send({error: "Failed to generate Google Calendar event"});
+        return;
+      }
+
+      console.log("Final event object being sent to Google API:", JSON.stringify(event, null, 2));
+
+      if (data.operation === Operation.CREATE) {
+        const response = await createEvent(calendar, event, data["appointment_id"]);
+        sendResponse(res, response);
+      }
+
+      if (data.operation === Operation.UPDATE) {
+        const response = await updateEvent(calendar, data["appointment_id"], event);
+        sendResponse(res, response);
+      }
     }
   } catch (error) {
-    console.error("Error:", error);
-    context.status(500).send({error: "Internal server error"});
+    console.error("Unhandled error in googleCalendarEvent:", error);
+    res.status(500).send({error: "Internal server error"});
   }
 });
 
 async function getGoogleOAuthConfig(): Promise<Credentials> {
-  const storageBucket = admin.storage().bucket();
-  const file = storageBucket.file("google_calendar_config/credentials.json");
-
-  const fileContents = await file.download();
+  const file = admin.storage().bucket().file("google_calendar_config/credentials.json");
+  const [fileContents] = await file.download();
   return JSON.parse(fileContents.toString());
 }
 
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-async function createEvent(calendar: calendar_v3.Calendar, event: calendar_v3.Schema$Event, appId: string): Promise<GoogleCalendarResponse | undefined> {
+async function handleDeleteOperation(
+  appointmentId: string,
+  calendar: CalendarV3.Calendar,
+  res: any
+): Promise<void> {
+  const appDoc = await db.collection("appointments").doc(appointmentId).get();
+  const eventId = appDoc.data()?.google_calendar_event_id;
+  if (!eventId) {
+    console.error("Missing google_calendar_event_id in appointment doc:", appDoc.data());
+    res.status(400).send({error: "Missing calendar event id"});
+    return;
+  }
+  await deleteEvent(eventId, calendar);
+  res.status(200).send("Event deleted successfully.");
+}
+
+async function createEvent(
+  calendar: CalendarV3.Calendar,
+  event: CalendarV3.Schema$Event,
+  appointmentId: string
+): Promise<GoogleCalendarResponse> {
   try {
     const response = await calendar.events.insert({
-      calendarId: "aetherium.esteticaaurea@gmail.com",
+      calendarId: "davideromano5991@gmail.com",
       requestBody: event,
       sendUpdates: "all",
     });
 
-
-    if (response?.status === 200 && appId) {
-      const savedEvent = response.data;
-      const appRef = db.collection("appointments").doc(appId);
-      await appRef.update({"google_calendar_event_id": savedEvent?.id});
-      console.log("data", response.data);
-      console.log("Event created with ID:", savedEvent?.id);
+    if (response?.status === 200 && response.data.id) {
+      await db.collection("appointments").doc(appointmentId).update({
+        google_calendar_event_id: response.data.id,
+      });
+      console.log("Event created with ID:", response.data.id);
     }
 
-    return response;
-  } catch (err) {
-    console.error("Error inserting event:", err);
-    return {status: 400};
+    return {status: response.status || 400, data: response.data};
+  } catch (error: any) {
+    const googleError = error.response?.data?.error?.message || error.message || JSON.stringify(error);
+    console.error("Google Calendar API error:", googleError);
+    return {status: 400, data: {error: googleError}};
   }
 }
 
-async function editEvent(eventId: string, calendar: calendar_v3.Calendar, event: calendar_v3.Schema$Event): Promise<GoogleCalendarResponse | undefined> {
+async function updateEvent(
+  calendar: CalendarV3.Calendar,
+  appointmentId: string,
+  event: CalendarV3.Schema$Event
+): Promise<GoogleCalendarResponse> {
+  const appDoc = await db.collection("appointments").doc(appointmentId).get();
+  const eventId = appDoc.data()?.google_calendar_event_id;
+
+  if (!eventId) {
+    console.error("No calendar event ID found for update.");
+    return {status: 400, data: {error: "Missing google_calendar_event_id"}};
+  }
+
   try {
     const response = await calendar.events.update({
-      calendarId: "aetherium.esteticaaurea@gmail.com",
-      eventId: eventId,
+      calendarId: "davideromano5991@gmail.com",
+      eventId,
       requestBody: event,
       sendUpdates: "all",
     });
-
-    if (response?.status === 200) {
-      console.log("Event updated:", response.data);
-    }
-    return response;
-  } catch (error) {
-    console.error("Error editing event:", error);
-    return {status: 400};
+    console.log("Event updated:", JSON.stringify(response.data, null, 2));
+    return {status: response.status || 400, data: response.data};
+  } catch (error: any) {
+    const googleError = error.response?.data?.error?.message || error.message || JSON.stringify(error);
+    console.error("Google Calendar API error (update):", googleError);
+    return {status: 400, data: {error: googleError}};
   }
 }
 
-// Delete an event
-async function deleteEvent(eventId: string, calendar: calendar_v3.Calendar) {
+async function deleteEvent(eventId: string, calendar: CalendarV3.Calendar): Promise<void> {
   try {
     await calendar.events.delete({
-      calendarId: "aetherium.esteticaaurea@gmail.com",
-      eventId: eventId,
+      calendarId: "davideromano5991@gmail.com",
+      eventId,
       sendUpdates: "all",
     });
+    console.log("Event deleted:", eventId);
   } catch (error) {
     console.error("Error deleting event:", error);
   }
 }
 
-async function getGoogleCalendarEventFromAppointment(appointment: Appointment): Promise<calendar_v3.Schema$Event | undefined> {
-  // nomecliente - cat_treatment - treatment_name
-  const docRef = db.collection("clients").doc(appointment.client_id);
-  const docSnapshot = await docRef.get();
-  const client = docSnapshot.exists ? docSnapshot.data() as Client : null;
-  const treatmentList = await getTreatmentList(appointment);
-  const treatmentDescriptions = treatmentList.map((treat) => `${treat.treatment_category_name} ${treat.name}`);
-
-  if (client) {
-    const event: calendar_v3.Schema$Event = {
-      summary: `${client.first_name} - ${client.last_name} - ${treatmentDescriptions.join(" ")}`,
-      description: "",
-      start: {
-        dateTime: replaceMillisecondsAndUTCOffset(appointment.start_time),
-        timeZone: "Europe/Rome",
-      },
-      end: {
-        dateTime: replaceMillisecondsAndUTCOffset(appointment.end_time),
-        timeZone: "Europe/Rome",
-      },
-      location: "Via Antonio Allegri, 39, 25124 Brescia BS",
-      reminders: {
-        useDefault: false,
-        overrides: [
-          {method: "email", minutes: 30},
-          {method: "popup", minutes: 10},
-        ],
-      },
-      visibility: "default",
-      transparency: "opaque",
-    };
-    return event;
+function formatGoogleDateTime(dateTime: string): string {
+  const m = moment.tz(dateTime, "YYYY-MM-DD HH:mm:ss.SSS", "Europe/Rome");
+  if (!m.isValid()) {
+    console.error(`Invalid datetime passed to formatGoogleDateTime: ${dateTime}`);
+    throw new Error(`Invalid datetime: ${dateTime}`);
   }
-  return undefined;
+  return m.tz("Europe/Rome").format();
+}
+
+async function getGoogleCalendarEvent(
+  appointment: Appointment,
+  appointmentId: string
+): Promise<CalendarV3.Schema$Event | undefined> {
+  console.log("appointmentId", appointmentId);
+
+  const clientSnap = await db.collection("clients").doc(appointment["client_id"]).get();
+  const client = clientSnap.exists ? (clientSnap.data() as Client) : null;
+
+  if (!client) {
+    console.warn("Client not found:", appointment["client_id"]);
+    throw new Error("Client is empty or undefined");
+  }
+
+  if (!client.first_name || !client.last_name) {
+    console.error("Client first_name or last_name is missing:", client);
+    throw new Error("Missing client first_name or last_name");
+  }
+
+  const treatments = await getTreatmentList(appointment);
+  const treatmentSummary = treatments.map((t) => `${t.treatment_category_name} ${t.name}`).join(", ");
+  const firstName = client.first_name ?? "";
+  const lastName = client.last_name ?? "";
+  const summary = `${firstName} ${lastName} - ${treatmentSummary}`.trim();
+
+  if (!summary) {
+    throw new Error("Generated summary is empty");
+  }
+
+  console.log("Generated treatment summary:", treatmentSummary);
+  console.log("appointment.id for extendedProperties:", appointmentId);
+
+  let colorId: string | undefined = undefined;
+
+  try {
+    if (appointment.color_id) {
+      const colorDoc = await db.collection("colors").doc(appointment.color_id).get();
+      if (colorDoc.exists) {
+        const colorData = colorDoc.data();
+        colorId = String(colorData?.color_id); // convert to string for Google Calendar
+      } else {
+        console.warn(`Color document not found: ${appointment.color_id}`);
+      }
+    }
+  } catch (error) {
+    console.error(`Error fetching color_id for ${appointment.color_id}:`, error);
+  }
+
+  return {
+    summary: summary,
+    description: summary,
+    start: {
+      dateTime: formatGoogleDateTime(appointment["start_time"]),
+      timeZone: "Europe/Rome",
+    },
+    end: {
+      dateTime: formatGoogleDateTime(appointment["end_time"]),
+      timeZone: "Europe/Rome",
+    },
+    extendedProperties: {
+      private: {
+        appointment_id: appointmentId,
+      },
+    },
+    location: "Via Antonio Allegri, 39, 25124 Brescia BS",
+    reminders: {
+      useDefault: false,
+      overrides: [
+        { method: "email", minutes: 30 },
+        { method: "popup", minutes: 10 },
+      ],
+    },
+    visibility: "default",
+    colorId: colorId ?? "5", // fallback to default colorId if not found
+    transparency: "opaque",
+  };
 }
 
 async function getTreatmentList(appointment: Appointment): Promise<Treatment[]> {
-  const treatmentCategoryMap: Map<string, string> = await getTreatmentCateogories();
-  const treatmentRef = appointment.treatment_id_list.map((id) => db.collection("treatments").doc(id));
+  const categoryMap = await getTreatmentCategories();
+  const treatmentRefs = appointment["treatment_id_list"].map((id) =>
+    db.collection("treatments").doc(id)
+  );
+  const treatmentSnaps = await Promise.all(treatmentRefs.map((ref) => ref.get()));
 
-  // Use Promise.all to fetch all treatments in parallel
-  const treatmentSnapshots = await Promise.all(treatmentRef.map((ref) => ref.get()));
-
-  // Use filter and map to simplify data processing
-  const treatmentList = treatmentSnapshots
-      .filter((snapshot) => snapshot.exists)
-      .map((snapshot) => {
-        const treatment = snapshot.data() as Treatment;
-        treatment.treatment_category_name = treatmentCategoryMap.get(treatment.treatment_category_id);
-        return treatment;
-      });
-
-  return treatmentList;
+  return treatmentSnaps
+    .filter((snap) => snap.exists)
+    .map((snap) => {
+      const treatment = snap.data() as Treatment;
+      treatment["treatment_category_name"] =
+        categoryMap.get(treatment["treatment_category_id"]) || "Unknown";
+      return treatment;
+    });
 }
 
-function replaceMillisecondsAndUTCOffset(iso8601: string): string {
-  const modifiedString = iso8601.slice(0, -5) + "+01:00";
-  return modifiedString;
+async function getTreatmentCategories(): Promise<Map<string, string>> {
+  const snapshot = await db.collection("treatment_categories").get();
+  const map = new Map<string, string>();
+  snapshot.forEach((doc) => map.set(doc.id, doc.data().name));
+  return map;
 }
 
-async function getTreatmentCateogories(): Promise<Map<string, string>> {
-  const catMap = new Map<string, string>();
-  const treatmentCategoriesSnapshot = await db.collection("treatment_categories").get();
-  treatmentCategoriesSnapshot.docs.forEach((doc) => {
-    const cat = doc.data() as TreatmentCategory;
-    catMap.set(doc.id, cat.name);
-  });
-  return catMap;
+function sendResponse(res: any, response: GoogleCalendarResponse): void {
+  console.log("Google response object:", JSON.stringify(response, null, 2));
+  if (response.status === 200) {
+    res.status(200).send("Operation completed successfully.");
+  } else {
+    if ("error" in (response.data ?? {})) {
+      console.error("Returning error to client:", (response.data as { error: string }).error);
+      res.status(400).send({error: (response.data as { error: string }).error});
+    } else {
+      console.error("Returning generic failure to client");
+      res.status(400).send({error: "Operation failed."});
+    }
+  }
 }
